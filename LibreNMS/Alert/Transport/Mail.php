@@ -26,7 +26,6 @@ namespace LibreNMS\Alert\Transport;
 
 use App\Facades\DeviceCache;
 use App\Facades\LibrenmsConfig;
-use App\Models\AlertLog;
 use App\Models\Eventlog;
 use Exception;
 use Illuminate\Support\Facades\DB;
@@ -103,19 +102,29 @@ class Mail extends Transport
     protected function threadingData(array $alert_data): array
     {
         $logId = (int) $alert_data['uid'];
+        $alertId = (int) ($alert_data['alert_id'] ?? 0);
+        $thread = $alertId ? DB::table('alerts')->useWritePdo()->where('id', $alertId)->first([
+            'mail_thread_root_id',
+            'mail_thread_subject',
+        ]) : null;
+        $storedRootId = (int) ($thread->mail_thread_root_id ?? 0);
         $previousRecovery = DB::table('alert_log')
+            ->useWritePdo()
             ->where('device_id', $alert_data['device_id'])
             ->where('rule_id', $alert_data['rule_id'])
             ->where('state', AlertState::RECOVERED)
             ->where('id', '<', $logId)
             ->max('id') ?? 0;
-        $rootId = (int) DB::table('alert_log')
-            ->where('device_id', $alert_data['device_id'])
-            ->where('rule_id', $alert_data['rule_id'])
-            ->where('state', '!=', AlertState::RECOVERED)
-            ->where('id', '>', $previousRecovery)
-            ->where('id', '<=', $logId)
-            ->min('id');
+        $rootId = $storedRootId && $storedRootId > $previousRecovery
+            ? $storedRootId
+            : (int) DB::table('alert_log')
+                ->useWritePdo()
+                ->where('device_id', $alert_data['device_id'])
+                ->where('rule_id', $alert_data['rule_id'])
+                ->where('state', '!=', AlertState::RECOVERED)
+                ->where('id', '>', $previousRecovery)
+                ->where('id', '<=', $logId)
+                ->min('id');
 
         // Be defensive for synthetic/test notifications which have no alert_log row.
         $rootId = $rootId ?: $logId;
@@ -141,7 +150,11 @@ class Mail extends Transport
         }
 
         return [
-            'subject' => $this->canonicalSubject($alert_data, $rootId),
+            'subject' => $this->canonicalSubject(
+                $alert_data,
+                $rootId,
+                $storedRootId === $rootId ? $thread?->mail_thread_subject : null
+            ),
             'headers' => $headers,
         ];
     }
@@ -153,12 +166,10 @@ class Mail extends Transport
         return substr(hash('sha256', $installationKey), 0, 16);
     }
 
-    private function canonicalSubject(array $alert_data, int $rootId): string
+    private function canonicalSubject(array $alert_data, int $rootId, ?string $storedSubject): string
     {
-        $rootLog = AlertLog::find($rootId);
-        $details = $rootLog?->details ?? [];
-        if (isset($details['mail_thread_subject'])) {
-            return $details['mail_thread_subject'];
+        if ($storedSubject !== null) {
+            return $storedSubject;
         }
 
         $template = $alert_data['template'] ?? null;
@@ -174,10 +185,23 @@ class Mail extends Transport
             'name' => $template?->name ?? '',
         ]);
 
-        if ($rootLog) {
-            $details['mail_thread_subject'] = $subject;
-            $rootLog->details = $details;
-            $rootLog->save();
+        if (! empty($alert_data['alert_id'])) {
+            $stored = DB::table('alerts')
+                ->where('id', $alert_data['alert_id'])
+                ->where(function ($query) use ($rootId): void {
+                    $query->whereNull('mail_thread_subject')
+                        ->orWhere('mail_thread_root_id', '!=', $rootId)
+                        ->orWhereNull('mail_thread_root_id');
+                })->update([
+                    'mail_thread_root_id' => $rootId,
+                    'mail_thread_subject' => $subject,
+                ]);
+
+            if (! $stored) {
+                return (string) DB::table('alerts')->useWritePdo()
+                    ->where('id', $alert_data['alert_id'])
+                    ->value('mail_thread_subject');
+            }
         }
 
         return $subject;

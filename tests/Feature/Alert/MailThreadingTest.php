@@ -10,10 +10,20 @@ use LibreNMS\Tests\TestCase;
 
 final class MailThreadingTest extends TestCase
 {
+    private int $alertId;
+
     protected function setUp(): void
     {
         parent::setUp();
         $this->dbSetUp();
+        $this->alertId = DB::table('alerts')->insertGetId([
+            'device_id' => 42,
+            'rule_id' => 84,
+            'state' => AlertState::ACTIVE,
+            'alerted' => AlertState::CLEAR,
+            'open' => 1,
+            'info' => '{}',
+        ]);
     }
 
     protected function tearDown(): void
@@ -45,6 +55,9 @@ final class MailThreadingTest extends TestCase
         $this->assertSame($problem['headers']['message_id'], $ack['headers']['in_reply_to']);
         $this->assertSame($problem['headers']['message_id'], $ack['headers']['references']);
         $this->assertNotSame($problem['headers']['message_id'], $ack['headers']['message_id']);
+
+        // Purging the root history must not change an active incident's thread.
+        DB::table('alert_log')->where('id', $problemId)->delete();
 
         $recoveryId = $this->log(AlertState::RECOVERED);
         $recovery = $mail->thread($this->alert($recoveryId, AlertState::RECOVERED, AlertState::ACKNOWLEDGED));
@@ -140,6 +153,7 @@ final class MailThreadingTest extends TestCase
         return [
             'uid' => $id,
             'id' => $id,
+            'alert_id' => $this->alertId,
             'device_id' => 42,
             'rule_id' => 84,
             'state' => $state,
