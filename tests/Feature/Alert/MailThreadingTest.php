@@ -2,6 +2,7 @@
 
 namespace LibreNMS\Tests\Feature\Alert;
 
+use App\Models\AlertTransport;
 use Illuminate\Support\Facades\DB;
 use LibreNMS\Alert\Transport\Mail;
 use LibreNMS\Enum\AlertState;
@@ -57,11 +58,35 @@ final class MailThreadingTest extends TestCase
         $this->assertSame("Incident $secondProblemId", $secondProblem['subject']);
     }
 
-    public function testThreadingIsDisabledByDefault(): void
+    public function testThreadingDisabledPreservesSubjectAndOmitsHeaders(): void
     {
         $setting = collect(Mail::configTemplate()['config'])->firstWhere('name', 'thread-notifications');
-
         $this->assertFalse($setting['default']);
+
+        $mail = new class(new AlertTransport(['transport_config' => [
+            'mail-contact' => 'email',
+            'email' => 'alerts@example.net',
+            'thread-notifications' => false,
+        ]])) extends Mail
+        {
+            public array $sent = [];
+
+            protected function send($emails, string $subject, string $message, bool $html, bool $bcc, ?bool $embedGraphs, ?array $headers): bool
+            {
+                $this->sent = compact('emails', 'subject', 'message', 'html', 'bcc', 'embedGraphs', 'headers');
+
+                return true;
+            }
+        };
+        $alert = $this->alert(123, AlertState::RECOVERED, AlertState::ACTIVE);
+        $alert['title'] = 'Existing localized recovery subject';
+        $alert['msg'] = 'Existing body';
+        $alert['faults'] = [];
+        $alert['transport_name'] = 'Mail test';
+
+        $this->assertTrue($mail->deliverAlert($alert));
+        $this->assertSame('Existing localized recovery subject', $mail->sent['subject']);
+        $this->assertNull($mail->sent['headers']);
     }
 
     private function log(int $state): int

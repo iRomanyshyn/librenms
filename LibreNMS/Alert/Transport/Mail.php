@@ -69,7 +69,7 @@ class Mail extends Transport
         try {
             $thread = ! empty($this->config['thread-notifications']) ? $this->threadingData($alert_data) : null;
 
-            return \LibreNMS\Util\Mail::send(
+            return $this->send(
                 $emails,
                 $thread['subject'] ?? $alert_data['title'],
                 $msg,
@@ -81,6 +81,15 @@ class Mail extends Transport
         } catch (Exception $e) {
             throw new AlertTransportDeliveryException($alert_data, 0, $e->getMessage());
         }
+    }
+
+    /**
+     * @param  array|string  $emails
+     * @param  array{message_id?: string, in_reply_to?: string, references?: string}|null  $headers
+     */
+    protected function send($emails, string $subject, string $message, bool $html, bool $bcc, ?bool $embedGraphs, ?array $headers): bool
+    {
+        return \LibreNMS\Util\Mail::send($emails, $subject, $message, $html, $bcc, $embedGraphs, $headers);
     }
 
     /**
@@ -148,7 +157,7 @@ class Mail extends Transport
 
     private function messageIdHost(): string
     {
-        return trim((string) preg_replace('/[^a-z0-9.-]+/i', '-', gethostname()), '-.') ?: 'localhost';
+        return trim((string) preg_replace('/[^a-z0-9.-]+/i', '-', (string) gethostname()), '-.') ?: 'localhost';
     }
 
     public static function configTemplate(): array
