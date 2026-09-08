@@ -28,9 +28,12 @@ use App\Facades\DeviceCache;
 use App\Facades\LibrenmsConfig;
 use App\Models\Eventlog;
 use Exception;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 use LibreNMS\Alert\AlertUtil;
+use LibreNMS\Alert\Template;
 use LibreNMS\Alert\Transport;
+use LibreNMS\Enum\AlertState;
 use LibreNMS\Enum\Severity;
 use LibreNMS\Exceptions\AlertTransportDeliveryException;
 use Spatie\Permission\Models\Role;
@@ -64,10 +67,144 @@ class Mail extends Transport
         }
 
         try {
-            return \LibreNMS\Util\Mail::send($emails, $alert_data['title'], $msg, $html, $this->config['bcc'] ?? false, $this->config['attach-graph'] ?? null);
+            $thread = ! empty($this->config['thread-notifications']) ? $this->threadingData($alert_data) : null;
+
+            return $this->send(
+                $emails,
+                $thread['subject'] ?? $alert_data['title'],
+                $msg,
+                $html,
+                $this->config['bcc'] ?? false,
+                $this->config['attach-graph'] ?? null,
+                $thread['headers'] ?? null
+            );
         } catch (Exception $e) {
             throw new AlertTransportDeliveryException($alert_data, 0, $e->getMessage());
         }
+    }
+
+    /**
+     * @param  array|string  $emails
+     * @param  array{message_id?: string, in_reply_to?: string, references?: string}|null  $headers
+     */
+    protected function send($emails, string $subject, string $message, bool $html, bool $bcc, ?bool $embedGraphs, ?array $headers): bool
+    {
+        return \LibreNMS\Util\Mail::send($emails, $subject, $message, $html, $bcc, $embedGraphs, $headers);
+    }
+
+    /**
+     * Build the canonical subject and RFC thread headers for this alert incident.
+     * A recovered log row terminates the preceding incident, so the first row after
+     * the previous recovery is the root even when alerts.id is reused.
+     *
+     * @return array{subject: string, headers: array{message_id: string, in_reply_to?: string, references?: string}}
+     */
+    protected function threadingData(array $alert_data): array
+    {
+        $logId = (int) $alert_data['uid'];
+        $alertId = (int) ($alert_data['alert_id'] ?? 0);
+        $thread = $alertId ? DB::table('alerts')->useWritePdo()->where('id', $alertId)->first([
+            'mail_thread_root_id',
+            'mail_thread_subject',
+        ]) : null;
+        $storedRootId = (int) ($thread->mail_thread_root_id ?? 0);
+        $previousRecovery = DB::table('alert_log')
+            ->useWritePdo()
+            ->where('device_id', $alert_data['device_id'])
+            ->where('rule_id', $alert_data['rule_id'])
+            ->where('state', AlertState::RECOVERED)
+            ->where('id', '<', $logId)
+            ->max('id') ?? 0;
+        $rootId = $storedRootId && $storedRootId > $previousRecovery
+            ? $storedRootId
+            : (int) DB::table('alert_log')
+                ->useWritePdo()
+                ->where('device_id', $alert_data['device_id'])
+                ->where('rule_id', $alert_data['rule_id'])
+                ->where('state', '!=', AlertState::RECOVERED)
+                ->where('id', '>', $previousRecovery)
+                ->where('id', '<=', $logId)
+                ->min('id');
+
+        // Be defensive for synthetic/test notifications which have no alert_log row.
+        $rootId = $rootId ?: $logId;
+        $rootMessageId = sprintf(
+            '<librenms-alert-%s-%d-%d-%d@alerts.librenms>',
+            $this->installationId(),
+            $alert_data['device_id'],
+            $alert_data['rule_id'],
+            $rootId
+        );
+        $initial = $logId === $rootId
+            && (int) $alert_data['state'] === AlertState::ACTIVE
+            && (int) ($alert_data['alerted'] ?? AlertState::CLEAR) !== AlertState::ACTIVE;
+        $headers = ['message_id' => $initial ? $rootMessageId : sprintf(
+            '<librenms-alert-%s-%d-%s@alerts.librenms>',
+            $this->installationId(),
+            $rootId,
+            bin2hex(random_bytes(12))
+        )];
+        if (! $initial) {
+            $headers['in_reply_to'] = $rootMessageId;
+            $headers['references'] = $rootMessageId;
+        }
+
+        return [
+            'subject' => $this->canonicalSubject(
+                $alert_data,
+                $rootId,
+                $storedRootId === $rootId ? $thread?->mail_thread_subject : null
+            ),
+            'headers' => $headers,
+        ];
+    }
+
+    private function installationId(): string
+    {
+        $installationKey = (string) config('app.key') ?: (string) LibrenmsConfig::get('email_from');
+
+        return substr(hash('sha256', $installationKey), 0, 16);
+    }
+
+    private function canonicalSubject(array $alert_data, int $rootId, ?string $storedSubject): string
+    {
+        if ($storedSubject !== null) {
+            return $storedSubject;
+        }
+
+        $template = $alert_data['template'] ?? null;
+        $subjectAlert = $alert_data;
+        $subjectAlert['id'] = $rootId;
+        $subjectAlert['uid'] = $rootId;
+        $subjectAlert['state'] = AlertState::ACTIVE;
+        $subjectAlert['title'] = $template?->title
+            ?: ($alert_data['title'] ?? 'Alert for device ' . ($alert_data['display'] ?? $alert_data['hostname'] ?? $alert_data['device_id']) . ' - ' . ($alert_data['name'] ?? $alert_data['rule_id']));
+        $subject = (new Template)->getTitle([
+            'alert' => $subjectAlert,
+            'title' => $subjectAlert['title'],
+            'name' => $template?->name ?? '',
+        ]);
+
+        if (! empty($alert_data['alert_id'])) {
+            $stored = DB::table('alerts')
+                ->where('id', $alert_data['alert_id'])
+                ->where(function ($query) use ($rootId): void {
+                    $query->whereNull('mail_thread_subject')
+                        ->orWhere('mail_thread_root_id', '!=', $rootId)
+                        ->orWhereNull('mail_thread_root_id');
+                })->update([
+                    'mail_thread_root_id' => $rootId,
+                    'mail_thread_subject' => $subject,
+                ]);
+
+            if (! $stored) {
+                return (string) DB::table('alerts')->useWritePdo()
+                    ->where('id', $alert_data['alert_id'])
+                    ->value('mail_thread_subject');
+            }
+        }
+
+        return $subject;
     }
 
     public static function configTemplate(): array
@@ -118,6 +255,13 @@ class Mail extends Transport
                     'descr' => 'Include graph image data in the email.  Will be embedded if html5, otherwise attached. Template must use @signedGraphTag',
                     'type' => 'checkbox',
                     'default' => true,
+                ],
+                [
+                    'title' => 'Thread notifications',
+                    'name' => 'thread-notifications',
+                    'descr' => 'Group all notifications for an alert incident into one email thread',
+                    'type' => 'checkbox',
+                    'default' => false,
                 ],
             ],
             'validation' => [
