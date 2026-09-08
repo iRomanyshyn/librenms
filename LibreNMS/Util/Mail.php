@@ -65,12 +65,11 @@ class Mail
      * @param  bool  $html
      * @param  bool  $bcc
      * @param  bool|null  $embedGraphs
-     * @param  array{message_id?: string, in_reply_to?: string, references?: string}|null  $headers
      * @return bool
      *
      * @throws \PHPMailer\PHPMailer\Exception if delivery fails
      */
-    public static function send($emails, $subject, $message, bool $html = false, bool $bcc = false, ?bool $embedGraphs = null, ?array $headers = null): bool
+    public static function send($emails, $subject, $message, bool $html = false, bool $bcc = false, ?bool $embedGraphs = null): bool
     {
         if (is_array($emails) || ($emails = self::parseEmails($emails))) {
             d_echo("Attempting to email $subject to: " . implode('; ', array_keys($emails)) . PHP_EOL);
@@ -92,15 +91,6 @@ class Mail
             $mail->CharSet = 'utf-8';
             $mail->WordWrap = 76;
             $mail->Body = $message;
-            if (isset($headers['message_id'])) {
-                $mail->MessageID = $headers['message_id'];
-            }
-            if (isset($headers['in_reply_to'])) {
-                $mail->addCustomHeader('In-Reply-To', $headers['in_reply_to']);
-            }
-            if (isset($headers['references'])) {
-                $mail->addCustomHeader('References', $headers['references']);
-            }
             if ($embedGraphs ?? LibrenmsConfig::get('email_attach_graphs')) {
                 self::embedGraphs($mail, $html);
             }
